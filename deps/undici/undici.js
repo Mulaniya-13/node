@@ -4691,6 +4691,7 @@ var require_runtime_features = __commonJS({
 var require_webidl = __commonJS({
   "lib/web/webidl/index.js"(exports2, module2) {
     "use strict";
+    var assert = require("node:assert");
     var { types, inspect } = require("node:util");
     var { runtimeFeatures } = require_runtime_features();
     var UNDEFINED = 1;
@@ -5034,6 +5035,27 @@ var require_webidl = __commonJS({
     webidl.is.MessagePort = webidl.util.MakeTypeAssertion(MessagePort);
     webidl.is.BufferSource = function(V) {
       return types.isArrayBuffer(V) || ArrayBuffer.isView(V) && types.isArrayBuffer(V.buffer);
+    };
+    webidl.util.getCopyOfBytesHeldByBufferSource = function(bufferSource) {
+      const jsBufferSource = bufferSource;
+      let jsArrayBuffer = jsBufferSource;
+      let offset = 0;
+      let length = 0;
+      if (types.isTypedArray(jsBufferSource) || types.isDataView(jsBufferSource)) {
+        jsArrayBuffer = jsBufferSource.buffer;
+        offset = jsBufferSource.byteOffset;
+        length = jsBufferSource.byteLength;
+      } else {
+        assert(types.isAnyArrayBuffer(jsBufferSource));
+        length = jsBufferSource.byteLength;
+      }
+      if (jsArrayBuffer.detached) {
+        return new Uint8Array(0);
+      }
+      const bytes = new Uint8Array(length);
+      const view = new Uint8Array(jsArrayBuffer, offset, length);
+      bytes.set(view);
+      return bytes;
     };
     webidl.converters.DOMString = function(V, prefix, argument, flags) {
       if (V === null && webidl.util.HasFlag(flags, webidl.attributes.LegacyNullToEmptyString)) {
@@ -6631,7 +6653,7 @@ var require_body = __commonJS({
     var { webidl } = require_webidl();
     var assert = require("node:assert");
     var { isErrored, isDisturbed } = require("node:stream");
-    var { isArrayBuffer } = require("node:util/types");
+    var { isUint8Array } = require("node:util/types");
     var { serializeAMimeType } = require_data_url();
     var { multipartFormDataParser } = require_formdata_parser();
     var { createDeferredPromise } = require_promise();
@@ -6651,20 +6673,19 @@ var require_body = __commonJS({
     });
     function extractBody(object, keepalive = false) {
       let stream = null;
+      let controller = null;
       if (webidl.is.ReadableStream(object)) {
         stream = object;
       } else if (webidl.is.Blob(object)) {
         stream = object.stream();
       } else {
         stream = new ReadableStream({
-          pull(controller) {
-            const buffer = typeof source === "string" ? textEncoder.encode(source) : source;
-            if (buffer.byteLength) {
-              controller.enqueue(buffer);
-            }
-            queueMicrotask(() => readableStreamClose(controller));
+          pull() {
           },
-          start() {
+          start(c) {
+            controller = c;
+          },
+          cancel() {
           },
           type: "bytes"
         });
@@ -6681,7 +6702,7 @@ var require_body = __commonJS({
         source = object.toString();
         type = "application/x-www-form-urlencoded;charset=UTF-8";
       } else if (webidl.is.BufferSource(object)) {
-        source = isArrayBuffer(object) ? new Uint8Array(object.slice()) : new Uint8Array(object.buffer.slice(object.byteOffset, object.byteOffset + object.byteLength));
+        source = webidl.util.getCopyOfBytesHeldByBufferSource(object);
       } else if (webidl.is.FormData(object)) {
         const boundary = `----formdata-undici-0${`${random(1e11)}`.padStart(11, "0")}`;
         const prefix = `--${boundary}\r
@@ -6748,38 +6769,29 @@ Content-Type: ${value.type || "application/octet-stream"}\r
         }
         stream = webidl.is.ReadableStream(object) ? object : ReadableStreamFrom(object);
       }
-      if (typeof source === "string" || util.isBuffer(source)) {
-        length = Buffer.byteLength(source);
+      if (typeof source === "string" || isUint8Array(source)) {
+        action = /* @__PURE__ */ __name(() => {
+          length = typeof source === "string" ? Buffer.byteLength(source) : source.length;
+          return source;
+        }, "action");
       }
       if (action != null) {
-        let iterator;
-        stream = new ReadableStream({
-          start() {
-            iterator = action(object)[Symbol.asyncIterator]();
-          },
-          pull(controller) {
-            return iterator.next().then(({ value, done }) => {
-              if (done) {
-                queueMicrotask(() => {
-                  controller.close();
-                  controller.byobRequest?.respond(0);
-                });
-              } else {
-                if (!isErrored(stream)) {
-                  const buffer = new Uint8Array(value);
-                  if (buffer.byteLength) {
-                    controller.enqueue(buffer);
-                  }
-                }
+        ;
+        (async () => {
+          const result = action();
+          const iterator = result?.[Symbol.asyncIterator]?.();
+          if (iterator) {
+            for await (const bytes of iterator) {
+              if (isErrored(stream)) break;
+              if (bytes.length) {
+                controller.enqueue(new Uint8Array(bytes));
               }
-              return controller.desiredSize > 0;
-            });
-          },
-          cancel(reason) {
-            return iterator.return();
-          },
-          type: "bytes"
-        });
+            }
+          } else if (result?.length && !isErrored(stream)) {
+            controller.enqueue(typeof result === "string" ? textEncoder.encode(result) : new Uint8Array(result));
+          }
+          queueMicrotask(() => readableStreamClose(controller));
+        })();
       }
       const body = { stream, source, length };
       return [body, type];
@@ -7501,8 +7513,12 @@ var require_client_h1 = __commonJS({
         return 0;
       }
     };
-    function onParserTimeout(parser) {
-      const { socket, timeoutType, client, paused } = parser.deref();
+    function onParserTimeout(parserWeakRef) {
+      const parser = parserWeakRef.deref();
+      if (!parser) {
+        return;
+      }
+      const { socket, timeoutType, client, paused } = parser;
       if (timeoutType === TIMEOUT_HEADERS) {
         if (!socket[kWriting] || socket.writableNeedDrain || client[kRunning] > 1) {
           assert(!paused, "cannot be paused while waiting for headers");
@@ -15758,6 +15774,7 @@ var require_api_request = __commonJS({
           try {
             this.runInAsyncScope(callback, null, null, {
               statusCode,
+              statusText: statusMessage,
               headers,
               trailers: this.trailers,
               opaque,
@@ -16474,11 +16491,28 @@ var require_api = __commonJS({
 var { getGlobalDispatcher, setGlobalDispatcher } = require_global2();
 var EnvHttpProxyAgent = require_env_http_proxy_agent();
 var fetchImpl = require_fetch().fetch;
+function appendFetchStackTrace(err, filename) {
+  if (!err || typeof err !== "object") {
+    return;
+  }
+  const stack = typeof err.stack === "string" ? err.stack : "";
+  const normalizedFilename = filename.replace(/\\/g, "/");
+  if (stack && (stack.includes(filename) || stack.includes(normalizedFilename))) {
+    return;
+  }
+  const capture = {};
+  Error.captureStackTrace(capture, appendFetchStackTrace);
+  if (!capture.stack) {
+    return;
+  }
+  const captureLines = capture.stack.split("\n").slice(1).join("\n");
+  err.stack = stack ? `${stack}
+${captureLines}` : capture.stack;
+}
+__name(appendFetchStackTrace, "appendFetchStackTrace");
 module.exports.fetch = /* @__PURE__ */ __name(function fetch(init, options = void 0) {
   return fetchImpl(init, options).catch((err) => {
-    if (err && typeof err === "object") {
-      Error.captureStackTrace(err);
-    }
+    appendFetchStackTrace(err, __filename);
     throw err;
   });
 }, "fetch");
